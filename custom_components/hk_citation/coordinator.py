@@ -21,8 +21,11 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_THRESHOLD_MS,
     DOMAIN,
-    HEALTH_CHECK_PORT,
+    HTTPS_PROBE_ENDPOINT,
+    HTTPS_PROBE_TIMEOUT,
     HK_MODEL_PREFIX,
+    PORT_8008,
+    PORT_8443,
     PROBE_ENDPOINTS,
 )
 
@@ -103,10 +106,12 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return found
 
     async def _probe_speaker(self, ip: str) -> dict[str, Any]:
-        """Probe a speaker's health via HTTP POST endpoints."""
+        """Probe a speaker's health via port 8008 POST timing and port 8443 HTTPS timeout."""
         probes = []
+
+        # Port 8008 POST timing probes
         for endpoint, payload in PROBE_ENDPOINTS:
-            url = f"http://{ip}:{HEALTH_CHECK_PORT}{endpoint}"
+            url = f"http://{ip}:{PORT_8008}{endpoint}"
             try:
                 start = time.monotonic()
                 async with self._session.post(
@@ -139,14 +144,62 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     }
                 )
 
+        # Port 8443 HTTPS probe — timeout means frozen
+        https_url = f"https://{ip}:{PORT_8443}{HTTPS_PROBE_ENDPOINT}"
+        try:
+            start = time.monotonic()
+            async with self._session.get(
+                https_url,
+                ssl=False,
+                timeout=aiohttp.ClientTimeout(total=HTTPS_PROBE_TIMEOUT),
+            ) as resp:
+                elapsed_ms = (time.monotonic() - start) * 1000
+                probes.append(
+                    {
+                        "endpoint": "https:8443/eureka_info",
+                        "ms": round(elapsed_ms, 1),
+                        "error": "",
+                    }
+                )
+        except TimeoutError:
+            probes.append(
+                {
+                    "endpoint": "https:8443/eureka_info",
+                    "ms": HTTPS_PROBE_TIMEOUT * 1000,
+                    "error": "frozen (port 8443 timeout)",
+                }
+            )
+        except aiohttp.ClientError as err:
+            probes.append(
+                {
+                    "endpoint": "https:8443/eureka_info",
+                    "ms": 0,
+                    "error": str(err),
+                }
+            )
+
+        # Evaluate health — unhealthy if any probe fails
+        post_probes = probes[:2]
+        https_probe = probes[2] if len(probes) > 2 else None
+        worst_post_time = max((p["ms"] for p in post_probes), default=0)
+        post_slow = worst_post_time >= self.threshold_ms
+        post_errors = any(p["error"] for p in post_probes)
+        https_failed = https_probe is not None and bool(https_probe["error"])
+
+        healthy = not post_slow and not post_errors and not https_failed
         worst_time = max((p["ms"] for p in probes), default=0)
-        errors = [p for p in probes if p["error"]]
-        healthy = worst_time < self.threshold_ms and not errors
+
+        error = ""
+        if https_failed:
+            error = https_probe["error"]
+        elif post_errors:
+            error = next(p["error"] for p in post_probes if p["error"])
 
         return {
             "healthy": healthy,
             "response_time_ms": worst_time,
             "probes": probes,
+            "error": error,
         }
 
     async def _async_update_data(self) -> dict[str, Any]:
