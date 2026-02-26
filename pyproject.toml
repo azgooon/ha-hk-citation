@@ -11,8 +11,8 @@ license = "MIT"
 requires-python = ">=3.13"
 
 [project.urls]
-repository = "https://github.com/OWNER/ha-hk-citation"
-"Bug Tracker" = "https://github.com/OWNER/ha-hk-citation/issues"
+repository = "https://github.com/azgooon/ha-hk-citation"
+"Bug Tracker" = "https://github.com/azgooon/ha-hk-citation/issues"
 
 [dependency-groups]
 dev = [
