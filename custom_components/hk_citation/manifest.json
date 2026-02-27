@@ -1,12 +1,12 @@
 {
     "domain": "hk_citation",
     "name": "HK Citation Health Monitor",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "codeowners": ["@azgooon"],
     "config_flow": true,
     "documentation": "https://github.com/azgooon/ha-hk-citation",
     "issue_tracker": "https://github.com/azgooon/ha-hk-citation/issues",
     "iot_class": "local_polling",
-    "requirements": ["zeroconf>=0.131.0"],
+    "after_dependencies": ["zeroconf"],
     "single_instance_allowed": true
 }

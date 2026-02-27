@@ -8,11 +8,13 @@ from datetime import timedelta
 from typing import Any
 
 import aiohttp
+from homeassistant.components.zeroconf import async_get_instance
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from zeroconf import ServiceBrowser, ServiceInfo, ServiceStateChange, Zeroconf
+from zeroconf import DNSPointer, Zeroconf
+from zeroconf.asyncio import AsyncServiceInfo
 
 from .const import (
     CAST_SERVICE,
@@ -31,7 +33,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-MDNS_SCAN_TIMEOUT = 5.0
 PROBE_TIMEOUT = 5.0
 
 
@@ -62,27 +63,33 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Register a callback to be called when new speakers are discovered."""
         self._new_speaker_callbacks.append(callback_fn)
 
-    def _discover_speakers_sync(self) -> list[dict[str, str]]:
-        """Discover HK Citation speakers via mDNS (sync, runs in executor)."""
+    async def _discover_speakers(self) -> list[dict[str, str]]:
+        """Discover HK Citation speakers from HA's Zeroconf cache."""
+        zc = await async_get_instance(self.hass)
         found: list[dict[str, str]] = []
 
-        def on_state_change(
-            zeroconf: Zeroconf,
-            service_type: str,
-            name: str,
-            state_change: ServiceStateChange,
-        ) -> None:
-            if state_change is not ServiceStateChange.Added:
-                return
-            info = ServiceInfo(service_type, name)
-            if info.request(zeroconf, 3000):
+        # Get Cast service names from Zeroconf cache via PTR records
+        ptr_records = zc.cache.async_entries_with_name(CAST_SERVICE)
+        cast_names = [
+            record.alias
+            for record in ptr_records
+            if isinstance(record, DNSPointer)
+        ]
+        _LOGGER.debug("Found %d Cast services in Zeroconf cache", len(cast_names))
+
+        # Resolve each service to check if it's an HK Citation speaker
+        for name in cast_names:
+            try:
+                info = AsyncServiceInfo(CAST_SERVICE, name)
+                if not await info.async_request(zc, 3000):
+                    continue
                 addresses = info.parsed_addresses()
                 if not addresses:
-                    return
-                props = info.properties
+                    continue
+                props = info.properties or {}
                 model = props.get(b"md", b"").decode("utf-8", errors="replace")
                 if not model.startswith(HK_MODEL_PREFIX):
-                    return
+                    continue
                 found.append(
                     {
                         "name": props.get(b"fn", b"").decode(
@@ -95,14 +102,10 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "model": model,
                     }
                 )
+            except Exception:
+                _LOGGER.debug("Failed to resolve %s", name, exc_info=True)
 
-        zc = Zeroconf()
-        try:
-            ServiceBrowser(zc, CAST_SERVICE, handlers=[on_state_change])
-            time.sleep(MDNS_SCAN_TIMEOUT)
-        finally:
-            zc.close()
-
+        _LOGGER.debug("Found %d HK Citation speakers", len(found))
         return found
 
     async def _probe_speaker(self, ip: str) -> dict[str, Any]:
@@ -205,9 +208,7 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Discover speakers and check their health."""
         try:
-            discovered = await self.hass.async_add_executor_job(
-                self._discover_speakers_sync
-            )
+            discovered = await self._discover_speakers()
         except Exception as err:
             raise UpdateFailed(f"mDNS scan failed: {err}") from err
 
