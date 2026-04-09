@@ -16,6 +16,7 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up HK Citation Health Monitor from a config entry."""
     coordinator = HKCitationCoordinator(hass, entry)
+    await coordinator.async_load_speakers()
     await coordinator.async_config_entry_first_refresh()
 
     entry.runtime_data = coordinator

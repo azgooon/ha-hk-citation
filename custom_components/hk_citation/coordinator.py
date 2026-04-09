@@ -14,6 +14,7 @@ import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -34,6 +35,8 @@ _LOGGER = logging.getLogger(__name__)
 
 PROBE_TIMEOUT = 5.0
 MDNS_SCAN_SECONDS = 8
+STORAGE_KEY = f"{DOMAIN}.speakers"
+STORAGE_VERSION = 1
 
 # Standalone mDNS scanner script — runs in a separate process to bypass
 # HA's Zeroconf monkey-patching.
@@ -115,8 +118,13 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._session = async_get_clientsession(hass)
         self._known_uuids: set[str] = set()
         self._new_speaker_callbacks: list = []
-        # Persistent speaker registry — survives scan gaps
+        # Speaker registry — persisted to disk via HA Store so it survives
+        # HA restarts. Speakers that stop advertising on mDNS but are still
+        # reachable via HTTP will continue to be health-checked.
         self._speakers: dict[str, dict[str, str]] = {}
+        self._store = Store[dict[str, dict[str, str]]](
+            hass, STORAGE_VERSION, STORAGE_KEY
+        )
         self._initial_scan_done = False
 
         scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
@@ -126,6 +134,19 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name=DOMAIN,
             update_interval=timedelta(seconds=scan_interval),
         )
+
+    async def async_load_speakers(self) -> None:
+        """Load persisted speaker registry from disk."""
+        data = await self._store.async_load()
+        if data:
+            self._speakers = data
+            _LOGGER.info(
+                "Loaded %d speakers from persistent storage", len(self._speakers)
+            )
+
+    async def _save_speakers(self) -> None:
+        """Persist the speaker registry to disk."""
+        await self._store.async_save(dict(self._speakers))
 
     @property
     def threshold_ms(self) -> float:
@@ -140,16 +161,19 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Run mDNS scan and merge results into the speaker registry."""
         found_list = await self.hass.async_add_executor_job(_run_mdns_scan)
 
+        changed = False
         for s in found_list:
             uuid = s["uuid"]
             old = self._speakers.get(uuid)
             self._speakers[uuid] = s
             if not old:
                 _LOGGER.info("Discovered speaker: %s at %s", s["name"], s["ip"])
+                changed = True
             elif old["ip"] != s["ip"]:
                 _LOGGER.info(
                     "Speaker %s IP changed: %s -> %s", s["name"], old["ip"], s["ip"]
                 )
+                changed = True
 
         if found_list:
             _LOGGER.debug(
@@ -164,6 +188,9 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "mDNS scan found 0 new speakers, using %d from registry",
                 len(self._speakers),
             )
+
+        if changed:
+            await self._save_speakers()
 
     async def _verify_speaker_reachable(self, ip: str) -> bool:
         """Quick check if a speaker is reachable on port 8008."""
@@ -282,7 +309,12 @@ class HKCitationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             try:
                 await self._discover_speakers()
             except Exception as err:
-                raise UpdateFailed(f"mDNS scan failed: {err}") from err
+                if not self._speakers:
+                    raise UpdateFailed(f"mDNS scan failed: {err}") from err
+                _LOGGER.warning(
+                    "Initial mDNS scan failed, using %d speakers from persistent storage",
+                    len(self._speakers),
+                )
             self._initial_scan_done = True
         else:
             # Run discovery in the background — merge any updates
